@@ -1,0 +1,1173 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>スイカゲーム</title>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#07040d}
+body{display:flex;align-items:center;justify-content:center}
+canvas{display:block;cursor:crosshair;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+
+// ---------- config ----------
+const RADII  = [10, 14, 19, 25, 32, 40, 50, 62, 76, 92, 112];
+const COLORS = ['#ff2a4a', '#ff5d7a', '#a453ff', '#ffb020', '#ff7a1a', '#e8262f', '#e6e05a', '#ffb6c8', '#ffd43b', '#9be36a', '#2fbf4a'];
+const NF = RADII.length, MAX_LV = NF - 1; // watermelon
+// after the watermelon the cycle restarts as rainbow fruits (rainbow cherry, rainbow strawberry, ...)
+const TIER = lv => Math.floor(lv / NF), BASE = lv => lv % NF;
+const R = lv => RADII[BASE(lv)];
+const COL = lv => TIER(lv) === 0 ? COLORS[lv] : hslHex(Math.random() * 360, 90, 62);
+// how loud the effects get: rainbow fruits are tiny but count as big
+const EFF = lv => TIER(lv) === 0 ? lv : Math.min(12, BASE(lv) + 4 + (TIER(lv) - 1) * 2);
+function hslHex(h, s, l) {
+  s /= 100; l /= 100;
+  const f = n => { const k = (n + h / 30) % 12, c = l - s * Math.min(l, 1 - l) * Math.max(-1, Math.min(k - 3, 9 - k, 1)); return Math.round(c * 255).toString(16).padStart(2, '0'); };
+  return '#' + f(0) + f(8) + f(4);
+}
+const G = 1500;            // gravity px/s^2
+const BALL_E = 0.55;       // ball-ball restitution
+const PEG_E = 0.8;         // peg restitution
+const WALL_E = 0.6;
+const SPAWN_INTERVAL = 0.5;
+const MAX_BALLS = 700;
+const REL_COST = 2;         // score per released ball
+const REL_MAX_BALLS = 1100; // release may overfill a bit
+const PC = 40;              // peg grid cell
+const SUB = 3;
+
+// ---------- state ----------
+let W, H, DPR, area, pegs = [], pegBottom = 0;
+let balls = [], born = [], parts = [], rings = [], pops = [];
+let mx = 0, my = 0, down = false;
+let spawnT = 0, score = 0, dispScore = 0, scoreBump = 0;
+let combo = 0, comboT = 0, shake = 0, nextId = 1;
+let gates = [], laneY = 0;
+let hitstop = 0, zoom = 0, zx = 0, zy = 0, flash = 0, flashCol = '#fff', waves = [], rays = [], bgPulse = 0, bgCol = '#fff';
+
+// ---------- sprites ----------
+const sprites = [], RB_FRAMES = 12;
+let nowT = 0;
+function SPR(lv, ph = 0) {
+  if (TIER(lv) === 0) return sprites[lv] || (sprites[lv] = makeSprite(R(lv), COLORS[lv], lv));
+  const fr = sprites[lv] || (sprites[lv] = Array.from({ length: RB_FRAMES }, (_, i) => makeSprite(R(lv), null, lv, i / RB_FRAMES * Math.PI * 2)));
+  return fr[(ph + (nowT / 70 | 0)) % RB_FRAMES];
+}
+function shade(hex, k) {
+  const n = parseInt(hex.slice(1), 16);
+  let r = n >> 16, g = n >> 8 & 255, b = n & 255;
+  const f = c => Math.max(0, Math.min(255, Math.round(k > 0 ? c + (255 - c) * k : c * (1 + k))));
+  return `rgb(${f(r)},${f(g)},${f(b)})`;
+}
+function makeSprite(r, col, lv, hue = 0) {
+  const s = r > 150 ? 1 : 2, pad = 4, size = (r + pad) * 2;
+  const c = document.createElement('canvas');
+  c.width = c.height = size * s;
+  const g = c.getContext('2d');
+  g.scale(s, s);
+  g.translate(size / 2, size / 2);
+  if (col) {
+    const grd = g.createRadialGradient(-r * .35, -r * .4, r * .1, 0, 0, r);
+    grd.addColorStop(0, shade(col, .55));
+    grd.addColorStop(.55, col);
+    grd.addColorStop(1, shade(col, -.35));
+    g.fillStyle = grd;
+    g.beginPath(); g.arc(0, 0, r, 0, Math.PI * 2); g.fill();
+  } else { // rainbow body, rotated per animation frame
+    const cg = g.createConicGradient(hue, 0, 0);
+    for (let i = 0; i <= 6; i++) cg.addColorStop(i / 6, `hsl(${i * 60},95%,62%)`);
+    g.fillStyle = cg;
+    g.beginPath(); g.arc(0, 0, r, 0, Math.PI * 2); g.fill();
+    const sh = g.createRadialGradient(-r * .35, -r * .4, r * .1, 0, 0, r);
+    sh.addColorStop(0, 'rgba(255,255,255,.55)'); sh.addColorStop(.6, 'rgba(255,255,255,0)'); sh.addColorStop(1, 'rgba(0,0,0,.35)');
+    g.fillStyle = sh;
+    g.beginPath(); g.arc(0, 0, r, 0, Math.PI * 2); g.fill();
+  }
+  if (BASE(lv) === MAX_LV) { // stripes
+    g.save(); g.clip();
+    g.strokeStyle = 'rgba(10,70,20,.55)'; g.lineWidth = r * .12;
+    for (let k = -2; k <= 2; k++) { g.beginPath(); g.ellipse(k * r * .38, 0, r * .12, r * 1.1, 0, 0, Math.PI * 2); g.stroke(); }
+    g.restore();
+  }
+  if (TIER(lv) >= 2) { // second rainbow round and beyond: starry body + golden rim
+    g.save(); g.clip();
+    let seed = lv * 9301;
+    const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+    g.fillStyle = 'rgba(255,255,255,.8)';
+    for (let i = 0; i < 18 + lv; i++) {
+      const a = rnd() * Math.PI * 2, d = Math.sqrt(rnd()) * r * .9, sz = r * (.015 + rnd() * .03);
+      const x = Math.cos(a) * d, y = Math.sin(a) * d;
+      g.beginPath();
+      for (let k = 0; k < 8; k++) { const rr = k % 2 ? sz * .35 : sz; g.lineTo(x + Math.cos(k * Math.PI / 4) * rr, y + Math.sin(k * Math.PI / 4) * rr); }
+      g.fill();
+    }
+    g.restore();
+    g.strokeStyle = '#ffe27a'; g.lineWidth = Math.max(2, r * .05);
+    g.beginPath(); g.arc(0, 0, r - g.lineWidth / 2, 0, Math.PI * 2); g.stroke();
+  }
+  g.fillStyle = 'rgba(255,255,255,.55)';
+  g.beginPath(); g.ellipse(-r * .38, -r * .45, r * .28, r * .16, -0.6, 0, Math.PI * 2); g.fill();
+  // face
+  g.fillStyle = 'rgba(40,10,20,.85)';
+  const er = Math.max(1.2, r * .09);
+  g.beginPath(); g.arc(-r * .28, 0, er, 0, Math.PI * 2); g.arc(r * .28, 0, er, 0, Math.PI * 2); g.fill();
+  g.strokeStyle = 'rgba(40,10,20,.85)'; g.lineWidth = Math.max(1, r * .06); g.lineCap = 'round';
+  g.beginPath(); g.arc(0, r * .1, r * .14, .2 * Math.PI, .8 * Math.PI); g.stroke();
+  g.fillStyle = 'rgba(255,120,150,.35)';
+  g.beginPath(); g.arc(-r * .45, r * .18, r * .1, 0, Math.PI * 2); g.arc(r * .45, r * .18, r * .1, 0, Math.PI * 2); g.fill();
+  return { c, size };
+}
+
+// ---------- layout ----------
+// fixed logical resolution; the canvas is only scaled to fit the window
+const PW = 240; // croon panel width (one on each side of the board)
+W = 1560 + PW * 2 + 80; H = 900;
+area = { l: 40 + PW, r: W - 40 - PW, t: 16, b: H - 76 };
+const MID = (area.l + area.r) / 2;
+// two catch cups in the x5 lane (below the pegs): the left one feeds the left croon tower, the right one the right
+const CUP_HW = RADII[3] + 8; // posts at +-CUP_HW, an 8 ball just fits between them
+const CUP_X = [area.l + (area.r - area.l) * .15, area.l + (area.r - area.l) * .85];
+let CUP_Y = 0;
+const HEAD = 64; // strip above the board (inside the page margin) for the board total
+const BTN = { x: MID - 250, y: H - 64, w: 170, h: 52, hov: 0, push: 0 };
+let pool = 0, // score waiting to rain down (one ball per REL_COST, last one rounds up)
+    relTotal = 1, relRate = 0, relAcc = 0, pegGrid = [], PCOLS = 0, PROWS = 0;
+let VS = 1; // view scale
+function resize() {
+  DPR = Math.min(2, devicePixelRatio || 1);
+  VS = Math.min(innerWidth * .96 / W, innerHeight * .76 / H); // leave ~12% margin top and bottom
+  cv.width = Math.round(W * VS * DPR); cv.height = Math.round((H + HEAD) * VS * DPR);
+  cv.style.width = W * VS + 'px'; cv.style.height = (H + HEAD) * VS + 'px';
+}
+buildPegs();
+function buildPegs() {
+  pegs = [];
+  const sp = 58, top = area.t + 110, bot = area.t + (area.b - area.t) * 0.55;
+  let row = 0;
+  for (let y = top; y < bot; y += sp * .8, row++) {
+    if (row === 4) { laneY = y; continue; } // open lane for the x2 gates
+    const off = (row % 2) * sp / 2;
+    let col = 0;
+    for (let x = area.l + sp / 2 + off; x < area.r - sp / 3; x += sp, col++) pegs.push({ x, y, r: 4, glow: 0, note: col, row });
+  }
+  pegBottom = bot + 10;
+  CUP_Y = pegBottom + 40; // same height as the x5 gate
+  PCOLS = Math.ceil(W / PC); PROWS = Math.ceil(H / PC);
+  pegGrid = Array.from({ length: PCOLS * PROWS }, () => []);
+  for (const p of pegs) pegGrid[((p.y / PC) | 0) * PCOLS + ((p.x / PC) | 0)].push(p);
+  buildGates();
+}
+function buildGates() {
+  const mk = (mul, y, w, h, x, v, col) => ({ mul, y, w, h, x, v, col, hit: 0 });
+  gates = [
+    mk(2, laneY, 130, 24, area.l + 300, 170, '#2ec8dc'),
+    mk(2, laneY, 130, 24, area.l + 800, -230, '#2ec8dc'),
+    mk(2, laneY, 130, 24, area.l + 1250, 290, '#2ec8dc'),
+    mk(5, pegBottom + 40, 110, 28, MID, 260, '#ffc22e'),
+  ];
+  gates.forEach((g, i) => g.bit = 1 << i);
+}
+addEventListener('resize', resize);
+resize();
+mx = W / 2;
+
+// ---------- audio ----------
+let AC = null, master = null, lastTick = 0, lastThud = 0;
+function initAudio() {
+  if (AC) { if (AC.state === 'suspended') AC.resume(); return; }
+  AC = new (window.AudioContext || window.webkitAudioContext)();
+  const comp = AC.createDynamicsCompressor();
+  comp.threshold.value = -14; comp.knee.value = 6; comp.ratio.value = 6; comp.attack.value = .002; comp.release.value = .15;
+  const out = AC.createGain(); out.gain.value = 1.6;
+  comp.connect(out); out.connect(AC.destination);
+  master = AC.createGain(); master.gain.value = 1;
+  master.connect(comp);
+  // echo for spaciousness
+  const dl = AC.createDelay(), fb = AC.createGain(), wet = AC.createGain(), lp = AC.createBiquadFilter();
+  dl.delayTime.value = .13; fb.gain.value = .35; wet.gain.value = .3; lp.type = 'lowpass'; lp.frequency.value = 3000;
+  master.connect(dl); dl.connect(lp); lp.connect(fb); fb.connect(dl); lp.connect(wet); wet.connect(comp);
+}
+function tone(f, dur, type, vol, slide = 1, delay = 0) {
+  if (!AC) return;
+  const t = AC.currentTime + delay, o = AC.createOscillator(), g = AC.createGain();
+  o.type = type; f = Math.max(30, Math.min(12000, f)); o.frequency.setValueAtTime(f, t);
+  o.frequency.exponentialRampToValueAtTime(Math.max(20, f * slide), t + dur);
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(.0001, t + dur);
+  o.connect(g); g.connect(master); o.start(t); o.stop(t + dur + .02);
+}
+function noise(dur, vol, freq) {
+  if (!AC) return;
+  const len = AC.sampleRate * dur | 0, buf = AC.createBuffer(1, len, AC.sampleRate), d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len) ** 2;
+  const s = AC.createBufferSource(), f = AC.createBiquadFilter(), g = AC.createGain();
+  f.type = 'bandpass'; f.frequency.value = Math.max(80, freq); f.Q.value = .8; g.gain.value = vol;
+  s.buffer = buf; s.connect(f); f.connect(g); g.connect(master); s.start();
+}
+const PENTA = [0, 2, 4, 7, 9];
+const semi = n => 2 ** (n / 12);
+function sPop(lv, c) {
+  lv = Math.min(lv, 12);
+  const base = 330 * semi(Math.min(c, 24));
+  tone(base * Math.max(.4, 1 + (MAX_LV - lv) * .08), .14, 'square', .35, 2.4);
+  tone(base * 1.5, .22, 'triangle', .5, 1.6, .02);
+  tone(base * 2, .3, 'sine', .3, 1, .06);
+  noise(.12 + lv * .03, .9 + lv * .08, 2200 - lv * 150);
+  tone(160 - lv * 8, .25 + lv * .03, 'sine', 1.1, .25);           // kick
+  if (lv >= 4) { tone(55, .6 + lv * .05, 'sine', 1.2, .5); noise(.5, .7, 400); }
+  if (c >= 5) for (let i = 0; i < 3; i++) tone(base * 4 * semi(PENTA[i + 1]), .1, 'square', .12, 1, .05 + i * .04);
+}
+function sMerge(lv) {
+  lv = Math.min(lv, 12);
+  const base = 392 * semi(lv * 2);
+  const n = Math.min(lv + 2, 7);
+  for (let i = 0; i < n; i++) {
+    const nt = PENTA[i % 5] + 12 * Math.floor(i / 5);
+    tone(base * semi(nt), .18, 'triangle', .35, 1, i * .035);
+    tone(base * semi(nt) * 2, .12, 'square', .08, 1, i * .035);
+  }
+  tone(220 - lv * 12, .3 + lv * .05, 'sine', .6 + lv * .08, .3);
+  if (lv >= 4) { tone(45, .9, 'sawtooth', .35, .5); noise(.4 + lv * .08, .8, 600); }
+  if (lv >= 7) for (let i = 0; i < 6; i++) tone(1568 * semi(PENTA[i % 5]), .4, 'sine', .25, 1, .25 + i * .06);
+}
+function sTick(p) {
+  if (!AC) return;
+  const n = performance.now(); if (n - lastTick < 22) return; lastTick = n;
+  const nt = PENTA[p.note % 5] + 12 * (Math.floor(p.note / 5) % 3) - p.row;
+  tone(880 * semi(nt), .12, 'sine', .28, 1);
+  tone(1760 * semi(nt), .05, 'square', .05, 1);
+}
+function sGate(mul) {
+  if (mul === 5) {
+    [0, 4, 7, 12, 16, 19, 24].forEach((n, i) => { tone(523 * semi(n), .16, 'square', .22, 1, i * .04); tone(1046 * semi(n), .2, 'triangle', .25, 1, i * .04); });
+    tone(90, .3, 'sine', .9, .4);
+    noise(.5, .8, 3000);
+  } else {
+    [0, 7, 12].forEach((n, i) => { tone(659 * semi(n), .12, 'triangle', .22, 1, i * .045); tone(1318 * semi(n), .08, 'sine', .1, 1, i * .045); });
+    tone(160, .15, 'sine', .3, .5);
+  }
+}
+let lastQuiet = 0;
+function sMergeQuiet(lv) {
+  if (!AC) return;
+  const n = performance.now(); if (n - lastQuiet < 50) return; lastQuiet = n;
+  tone(600 * semi(Math.min(lv, 12) * 2), .06, 'sine', .06, 1.3);
+}
+function sThud(lv, v) {
+  lv = Math.min(lv, 12);
+  if (!AC) return;
+  const n = performance.now(); if (n - lastThud < 30) return; lastThud = n;
+  const k = Math.min(1, v / 1500);
+  tone(110 - lv * 6, .18 + lv * .03, 'sine', (.4 + lv * .08) * k + .1, .35);
+  noise(.06 + lv * .02, .4 * k + lv * .04, 300);
+}
+
+// ---------- entities ----------
+function addBall(x, y, lv, vx = 0, vy = 0, s = .3) {
+  const b = { id: nextId++, x, y, vx, vy, lv, r: R(lv), dead: false, s, sq: 0, fl: 0, stuck: 0, ghost: 0, gm: 0, nm: 0, quiet: 0, nogate: 0 };
+  born.push(b); return b;
+}
+function burst(x, y, col, n, spd, size) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, v = spd * (.3 + Math.random());
+    parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - spd * .3, life: 1, decay: .8 + Math.random() * 1.2,
+      sz: size * (.5 + Math.random()), col: Math.random() < .25 ? '#fff' : col, rot: Math.random() * 6, vr: (Math.random() - .5) * 20 });
+  }
+}
+
+function merge(a, b) {
+  a.dead = b.dead = true;
+  const ma = a.r * a.r, mb = b.r * b.r, t = ma + mb;
+  const x = (a.x * ma + b.x * mb) / t, y = (a.y * ma + b.y * mb) / t;
+  const nb = addBall(x, y, a.lv + 1, (a.vx * ma + b.vx * mb) / t, (a.vy * ma + b.vy * mb) / t - 80, 1.25);
+  const lv = EFF(nb.lv), col = COL(nb.lv);
+  nb.fl = 1; nb.gm = a.gm | b.gm;
+  nb.quiet = Math.max(a.quiet, b.quiet);
+  if (nb.quiet > 0) { // released balls: merge with only a light touch
+    burst(x, y, col, 4, 100, 2);
+    sMergeQuiet(lv);
+    return;
+  }
+  burst(x, y, col, Math.min(160, 10 + lv * 6), 160 + lv * 40, 2.5 + lv * .5);
+  rings.push({ x, y, r: nb.r * .6, max: nb.r * 2.2 + lv * 10, life: 1, col, w: 3 + lv });
+  rings.push({ x, y, r: nb.r, max: nb.r * 3.5 + lv * 25, life: 1, col: '#fff', w: 2 + lv * .5 });
+  if (lv >= 3) {
+    hitstop = Math.max(hitstop, Math.min(.6, .02 + lv * lv * .0045));
+    zoom = Math.max(zoom, Math.min(.15, .012 * lv)); zx = x; zy = y;
+    const nr = 6 + lv * 2;
+    for (let i = 0; i < nr; i++) rays.push({ x, y, a: i / nr * Math.PI * 2 + Math.random() * .3, len: nb.r * 2 + lv * 30, life: 1, col, w: 2 + lv * .8 });
+  }
+  if (lv >= 5) { flash = Math.max(flash, .08 + lv * .035); flashCol = col; }
+  bgPulse = Math.max(bgPulse, lv * .09); bgCol = col;
+  shake = Math.min(40, shake + lv * lv * .35);
+  sMerge(lv);
+}
+
+function breakBall(b) {
+  const e = EFF(b.lv);
+  if (b.dead) return;
+  b.dead = true;
+  combo = comboT > 0 ? combo + 1 : 1;
+  comboT = 1.0;
+  const mult = 1 + (Math.min(combo, 15) - 1) * .1; // +0.1 per combo, stops growing at combo 15 (x2.4)
+  const pts = Math.round(2 ** b.lv * mult); // cherry = 1, doubles per level
+  score += pts; scoreBump = Math.min(1, scoreBump + .35 + e * .06);
+  const col = COL(b.lv);
+  burst(b.x, b.y, col, Math.min(220, 14 + e * 8), 260 + e * 45, 3 + e * .6);
+  rings.push({ x: b.x, y: b.y, r: b.r, max: b.r * 3 + 40, life: 1, col, w: 4 + e });
+  rings.push({ x: b.x, y: b.y, r: b.r * .5, max: b.r * 2 + 20, life: 1, col: '#fff', w: 2 });
+  pops.push({ x: b.x, y: b.y - b.r, v: pts, life: 1, col, sz: 16 + e * 4 + Math.min(combo, 20) });
+  shake = Math.min(40, shake + 4 + e * 2.5);
+  if (e >= 4) { hitstop = Math.max(hitstop, .03 + e * .012); flash = Math.max(flash, .05 + e * .025); flashCol = col; zoom = Math.max(zoom, .008 * e); zx = b.x; zy = b.y; }
+  bgPulse = Math.max(bgPulse, .15 + e * .06); bgCol = col;
+  for (let i = 0; i < 6 + e * 2; i++) rays.push({ x: b.x, y: b.y, a: Math.random() * Math.PI * 2, len: b.r * 2.5 + 40 + e * 20, life: 1, col: i % 2 ? '#fff' : col, w: 2 + e * .6 });
+  // shockwave
+  const R = b.r * 3 + 60, F = 350 + e * 90;
+  for (const o of balls) {
+    if (o.dead) continue;
+    const dx = o.x - b.x, dy = o.y - b.y, d = Math.hypot(dx, dy);
+    if (d < R && d > 0) { const k = (1 - d / R) * F; o.vx += dx / d * k; o.vy += dy / d * k - k * .3; }
+  }
+  sPop(e, combo);
+}
+
+function hitAt(x, y) {
+  let best = null, bd = Infinity;
+  for (const b of balls) {
+    if (b.dead) continue;
+    const d = Math.hypot(b.x - x, b.y - y);
+    if (d < b.r + 4 && d / b.r < bd) { bd = d / b.r; best = b; }
+  }
+  if (best) breakBall(best);
+}
+
+// ---------- physics ----------
+// broadphase: small balls (r <= SMALL_R) go into a grid by center; the few big ones are checked against grid ranges
+const SMALL_R = 14, CS = SMALL_R * 2, GY0 = -600, GCOLS = Math.ceil(W / CS) + 1, GROWS = Math.ceil((H - GY0) / CS) + 1;
+const gHead = new Int32Array(GCOLS * GROWS);
+let gNext = new Int32Array(2048);
+const gx = x => Math.min(GCOLS - 1, Math.max(0, Math.floor(x / CS)));
+const gy = y => Math.min(GROWS - 1, Math.max(0, Math.floor((y - GY0) / CS)));
+function collide(a, b) {
+  const dx = b.x - a.x, dy = b.y - a.y, rr = a.r + b.r, d2 = dx * dx + dy * dy;
+  if (d2 >= rr * rr) return;
+  if (a.lv === b.lv && a.nm <= 0 && b.nm <= 0) { merge(a, b); return; }
+  const d = Math.sqrt(d2) || .01, nx = dx / d, ny = dy / d, pen = rr - d;
+  const ia = 1 / (a.r * a.r), ib = 1 / (b.r * b.r), it = ia + ib;
+  const c = pen * .8 / it;
+  a.x -= nx * c * ia; a.y -= ny * c * ia;
+  b.x += nx * c * ib; b.y += ny * c * ib;
+  const rv = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
+  if (rv < 0) {
+    if (rv < -300) { const q = Math.min(.25, -rv / 3000); a.sq = Math.max(a.sq, q); b.sq = Math.max(b.sq, q); }
+    const e = rv < -90 ? BALL_E : 0;
+    const jm = -(1 + e) * rv / it;
+    a.vx -= jm * ia * nx; a.vy -= jm * ia * ny;
+    b.vx += jm * ib * nx; b.vy += jm * ib * ny;
+  }
+}
+const bigs = [];
+function collideBalls() {
+  const n = balls.length;
+  if (gNext.length < n) gNext = new Int32Array(n * 2);
+  gHead.fill(-1); bigs.length = 0;
+  for (let i = 0; i < n; i++) {
+    const b = balls[i];
+    if (b.dead) continue;
+    if (b.r > SMALL_R) { bigs.push(b); continue; }
+    let cx = (b.x / CS) | 0, cy = ((b.y - GY0) / CS) | 0;
+    if (cx < 0) cx = 0; else if (cx >= GCOLS) cx = GCOLS - 1;
+    if (cy < 0) cy = 0; else if (cy >= GROWS) cy = GROWS - 1;
+    const k = cy * GCOLS + cx;
+    b.gk = k; gNext[i] = gHead[k]; gHead[k] = i;
+  }
+  // small vs small: same cell + 4 forward neighbours
+  for (let cy = 0; cy < GROWS; cy++) for (let cx = 0; cx < GCOLS; cx++) {
+    const k = cy * GCOLS + cx;
+    for (let i = gHead[k]; i !== -1; i = gNext[i]) {
+      const a = balls[i];
+      for (let j = gNext[i]; j !== -1; j = gNext[j]) { if (a.dead) break; const b = balls[j]; if (!b.dead) collide(a, b); }
+      if (a.dead) continue;
+      if (cx + 1 < GCOLS) for (let j = gHead[k + 1]; j !== -1; j = gNext[j]) { if (a.dead) break; const b = balls[j]; if (!b.dead) collide(a, b); }
+      if (cy + 1 < GROWS) for (let dxc = -1; dxc <= 1; dxc++) {
+        const nx = cx + dxc; if (nx < 0 || nx >= GCOLS) continue;
+        for (let j = gHead[k + GCOLS + dxc]; j !== -1; j = gNext[j]) { if (a.dead) break; const b = balls[j]; if (!b.dead) collide(a, b); }
+      }
+    }
+  }
+  // big vs small, big vs big
+  for (let bi = 0; bi < bigs.length; bi++) {
+    const a = bigs[bi];
+    if (a.dead) continue;
+    const x0 = gx(a.x - a.r - SMALL_R), x1 = gx(a.x + a.r + SMALL_R), y0 = gy(a.y - a.r - SMALL_R), y1 = gy(a.y + a.r + SMALL_R);
+    for (let cy = y0; cy <= y1; cy++) for (let cx = x0; cx <= x1; cx++)
+      for (let j = gHead[cy * GCOLS + cx]; j !== -1; j = gNext[j]) { if (a.dead) break; const b = balls[j]; if (!b.dead) collide(a, b); }
+    for (let bj = bi + 1; bj < bigs.length; bj++) { if (a.dead) break; const b = bigs[bj]; if (!b.dead) collide(a, b); }
+  }
+}
+function step(dt) {
+  for (const b of balls) {
+    b.vy += G * dt;
+    b.vx *= .9995; b.vy *= .9995;
+    const sp2 = b.vx * b.vx + b.vy * b.vy;
+    if (sp2 > 2200 * 2200) { const k = 2200 / Math.sqrt(sp2); b.vx *= k; b.vy *= k; }
+    b.x += b.vx * dt; b.y += b.vy * dt;
+    // walls
+    if (b.x - b.r < area.l) { b.x = area.l + b.r; if (b.vx < 0) b.vx = -b.vx * WALL_E; }
+    if (b.x + b.r > area.r) { b.x = area.r - b.r; if (b.vx > 0) b.vx = -b.vx * WALL_E; }
+    if (b.y + b.r > area.b) {
+      b.y = area.b - b.r;
+      if (b.vy > 0) {
+        if (b.vy > 220) groundHit(b, b.vy);
+        b.vy = b.vy > 60 ? -b.vy * WALL_E : 0;
+      }
+      b.vx *= .985;
+    }
+    // catch cups
+    for (const P of PANELS) {
+      const big = b.r > CUP_HW - 6, away = (b.x < P.px ? -1 : 1) * 400 * dt;
+      for (const sd of [-1, 1]) { // posts
+        const dx = b.x - (P.px + sd * CUP_HW), dy = b.y - CUP_Y, rr = b.r + 5, d2 = dx * dx + dy * dy;
+        if (d2 >= rr * rr) continue;
+        const d = Math.sqrt(d2) || .01, nx = dx / d, ny = dy / d;
+        b.x += nx * (rr - d); b.y += ny * (rr - d);
+        const vn = b.vx * nx + b.vy * ny;
+        if (vn < 0) { b.vx -= (1 + PEG_E) * vn * nx; b.vy -= (1 + PEG_E) * vn * ny; }
+        if (big) b.vx += away; // too big for the cup: roll off the posts instead of sitting there
+      }
+      if (Math.abs(b.x - P.px) >= CUP_HW) continue;
+      if (holeLock > 0) { // shut: a lid across the cup that balls roll off
+        if (b.y < CUP_Y + 4 && b.y + b.r > CUP_Y - 2) { b.y = CUP_Y - 2 - b.r; if (b.vy > 0) b.vy = -b.vy * .3; b.vx += away; }
+      } else if (!big && b.y > CUP_Y + 4 && b.y < CUP_Y + 40) { dropIn(b, P); break; }
+    }
+    if (b.dead) continue;
+    // pegs (a ball resting on pegs for a while wiggles, then slips through)
+    if (b.ghost > 0) b.ghost -= dt;
+    else if (b.y - b.r < pegBottom) {
+      if (Math.abs(b.vx) + Math.abs(b.vy) < 90) b.stuck += dt;
+      else b.stuck = Math.max(0, b.stuck - dt * 2);
+      if (b.stuck > .6) { b.stuck = 0; b.ghost = .3; b.vy += 120; b.fl = Math.max(b.fl, .4); }
+    } else b.stuck = 0;
+    if (b.y - b.r < pegBottom && b.ghost <= 0) {
+      const cx0 = Math.max(0, ((b.x - b.r - 4) / PC) | 0), cx1 = Math.min(PCOLS - 1, ((b.x + b.r + 4) / PC) | 0);
+      const cy0 = Math.max(0, Math.floor((b.y - b.r - 4) / PC)), cy1 = Math.min(PROWS - 1, Math.floor((b.y + b.r + 4) / PC));
+      for (let cy = cy0; cy <= cy1; cy++) for (let cx = cx0; cx <= cx1; cx++) for (const p of pegGrid[cy * PCOLS + cx]) {
+        const dx = b.x - p.x, dy = b.y - p.y, rr = b.r + p.r;
+        if (dx > rr || dx < -rr || dy > rr || dy < -rr) continue;
+        const d2 = dx * dx + dy * dy;
+        if (d2 >= rr * rr) continue;
+        const d = Math.sqrt(d2) || .01, nx = dx / d, ny = dy / d;
+        b.x += nx * (rr - d); b.y += ny * (rr - d);
+        const vn = b.vx * nx + b.vy * ny;
+        if (vn < 0) {
+          const e = vn < -80 ? PEG_E : 0;
+          b.vx -= (1 + e) * vn * nx; b.vy -= (1 + e) * vn * ny;
+          b.vx += (Math.random() - .5) * 20;
+          b.sq = Math.max(b.sq, Math.min(.3, -vn / 2500));
+          if (vn < -150) {
+            p.glow = 1; sTick(p);
+            if (waves.length < 50) waves.push({ x: p.x, y: p.y, t: 0, col: COL(b.lv), max: 70 + Math.min(80, -vn * .08) });
+          }
+        }
+      }
+    }
+  }
+  collideBalls();
+  if (born.length || balls.some(b => b.dead)) {
+    balls = balls.filter(b => !b.dead);
+    for (const b of born) balls.push(b);
+    born.length = 0;
+  }
+}
+
+function groundHit(b, v) {
+  const e = EFF(b.lv);
+  const k = v / 1000 * (.5 + e * .6) * (b.r / 20);
+  shake = Math.min(40, shake + Math.min(14, k * 2.2));
+  b.sq = Math.max(b.sq, Math.min(.4, v / 2000));
+  const n = 4 + e * 3;
+  for (let i = 0; i < n; i++) {
+    const dir = Math.random() < .5 ? -1 : 1, sp = (80 + Math.random() * 200) * (1 + e * .15);
+    parts.push({ x: b.x + dir * b.r * .6, y: area.b - 2, vx: dir * sp, vy: -Math.random() * sp * .8, life: .7, decay: 1.5 + Math.random(),
+      sz: 2 + Math.random() * (2 + e * .4), col: Math.random() < .5 ? '#fff' : COL(b.lv), rot: 0, vr: 0 });
+  }
+  if (e >= 2 || v > 700) rings.push({ x: b.x, y: area.b, r: b.r * .5, max: b.r * 2 + 30, life: .8, col: COL(b.lv), w: 2 + e * .5, flat: true });
+  sThud(e, v);
+}
+
+function gateHit(b, g) {
+  b.gm |= g.bit; b.nm = Math.max(b.nm, .6); b.fl = 1;
+  // split into n balls fanned out sideways
+  const n = g.mul, room = MAX_BALLS - balls.length - born.length, x0 = b.x, vx0 = b.vx;
+  for (let j = 0; j < n; j++) {
+    const o = j - (n - 1) / 2, x = x0 + o * b.r * 1.2, vx = vx0 + o * 110;
+    if (j === 0) { b.x = x; b.vx = vx; continue; }
+    if (room < j) break;
+    const c = addBall(x, b.y, b.lv, vx, b.vy, .6);
+    c.gm = b.gm; c.nm = b.nm; c.quiet = b.quiet; c.fl = 1;
+  }
+  g.hit = 1;
+  if (g.mul === 5) {
+    burst(b.x, g.y, g.col, 30, 380, 4);
+    rings.push({ x: b.x, y: g.y, r: 10, max: 160, life: 1, col: g.col, w: 6 });
+    pops.push({ x: b.x, y: g.y - 20, v: 0, txt: '×5', life: 1, col: g.col, sz: 44 });
+    shake = Math.min(40, shake + 10);
+    bgPulse = Math.max(bgPulse, .35); bgCol = g.col;
+    if (b.quiet <= 0) hitstop = Math.max(hitstop, .06); // no hitstop for released balls
+    zoom = Math.max(zoom, .03); zx = b.x; zy = g.y;
+  } else {
+    burst(b.x, g.y, g.col, 12, 200, 2.5);
+    rings.push({ x: b.x, y: g.y, r: 8, max: 70, life: 1, col: g.col, w: 3 });
+    pops.push({ x: b.x, y: g.y - 18, v: 0, txt: '×2', life: .8, col: g.col, sz: 24 });
+    shake = Math.min(40, shake + 2);
+  }
+  sGate(g.mul);
+}
+
+// ---------- croon ----------
+// balls that fall through a floor hole (left / right end) drop into that side's croon tower.
+// side view, same gravity as the board: each of the 3 stages is a peg row over a bowl whose holes
+// flow across it like a conveyor (in at one rim, out at the other). the belt is longer than the bowl,
+// so only ~VIS holes are in it at a time. one hole per belt is the gold V hole: it drops to the next
+// stage, any other hole loses the ball; the V hole of stage 3 is the jackpot.
+// every hole is the same size and they flow evenly, so each stage is 1/n:
+// 1/8 x 1/8 x 1/8 = 1/512 for the jackpot
+const CR = { rb: 130, br: 10, G: 1100, E: .35, PEG_E: .7, DRAG: .25, HOLE_H: 13, VIS: 2.6 };
+CR.hw = PW / 2; CR.a0 = Math.acos(CR.hw / CR.rb); CR.span = Math.PI - 2 * CR.a0; // bowl rims meet the panel walls
+const STG = [{ T: 30, n: 8, w: .5 }, { T: 250, n: 8, w: -.6 }, { T: 470, n: 8, w: .7 }];
+for (const s of STG) s.cy = s.T + 100 - CR.rb * Math.sin(CR.a0);
+const JP_Y = 772, JP_DUR = 5;
+const HOLE_LOCK = 7; // holes stay shut while balls rain from the top and this long after, so the rain can't loop back in
+const JP_PTS = lv => 2 ** lv * 1000;
+const PANELS = [0, 1].map(i => {
+  const l = i ? area.r + 20 : 20, cx = l + PW / 2, pegs = [];
+  STG.forEach((s, si) => {
+    for (let r = 0; r < 2; r++) {
+      let col = 0;
+      for (let x = -CR.hw + 30 + r * 20; x < CR.hw - 20; x += 40, col++) pegs.push({ x: cx + x, y: s.T + 35 + r * 32, r: 4, glow: 0, si, note: col + si * 2, row: r });
+    }
+  });
+  return { l, r: l + PW, cx, gx: i ? area.r + 10 : area.l - 10, px: CUP_X[i],
+    pegs, balls: [], ph: STG.map(() => Math.random() * 10), reach: 0 };
+});
+let travelers = [], jpT = 0, jpFw = 0, jpShow = 0, holeLock = 0, holeOpen = 1;
+// angle of hole k on the bowl, or null while it is on the hidden part of the belt
+const gapA = (P, si, k) => {
+  const L = CR.span * STG[si].n / CR.VIS, u = (((P.ph[si] + k * L / STG[si].n) % L) + L) % L;
+  return u < CR.span ? CR.a0 + u : null;
+};
+const gapH = k => CR.HOLE_H / CR.rb;
+
+function pathLen(p) { let L = 0; for (let i = 1; i < p.length; i++) L += Math.hypot(p[i][0] - p[i - 1][0], p[i][1] - p[i - 1][1]); return L; }
+function pathAt(p, d) {
+  for (let i = 1; i < p.length; i++) {
+    const l = Math.hypot(p[i][0] - p[i - 1][0], p[i][1] - p[i - 1][1]);
+    if (d <= l || i === p.length - 1) { const k = Math.max(0, Math.min(1, d / (l || 1))); return [p[i - 1][0] + (p[i][0] - p[i - 1][0]) * k, p[i - 1][1] + (p[i][1] - p[i - 1][1]) * k]; }
+    d -= l;
+  }
+}
+function travel(lv, pts, speed, done) { travelers.push({ lv, pts, d: 0, len: pathLen(pts), speed, done }); }
+function dropIn(b, P) {
+  b.dead = true;
+  const ey = STG[0].T + 4;
+  travel(b.lv, [[b.x, CUP_Y + 10], [P.gx, CUP_Y + 10], [P.gx, ey], [P.cx, ey]], 1500, () => enterStage(P, b.lv, 0));
+  burst(b.x, CUP_Y + 10, '#ffd43b', 10, 160, 2.5);
+  rings.push({ x: b.x, y: CUP_Y + 10, r: 6, max: 50, life: 1, col: '#ffd43b', w: 3 });
+  tone(700, .25, 'sine', .3, .3); tone(1400, .1, 'triangle', .12, .5);
+}
+function enterStage(P, lv, st) {
+  P.balls.push({ lv, st, x: P.cx + (Math.random() - .5) * 20, y: STG[st].T + 4, vx: (Math.random() - .5) * 120, vy: 100, still: 0 });
+  if (st === 2) {
+    P.reach = 2.5; sReach();
+  } else if (st === 1) [0, 7].forEach((n, i) => tone(880 * semi(n + 5), .1, 'triangle', .25, 1, i * .05));
+}
+function fell(P, c, k) {
+  c.dead = true;
+  const x = c.x, y = c.y;
+  if (k !== 0) { // lost
+    burst(x, y, '#776a90', 8, 90, 2);
+    pops.push({ x, y: y + 6, v: 0, txt: '×', life: .6, col: '#b9a8d8', sz: 20 });
+    tone(300 - c.st * 40, .35, 'triangle', .3, .4); tone(150, .3, 'sine', .3, .5);
+    return;
+  }
+  burst(x, y, '#ffd43b', 24 + c.st * 20, 240 + c.st * 80, 3);
+  rings.push({ x, y, r: 6, max: 70 + c.st * 30, life: 1, col: '#ffd43b', w: 4 });
+  pops.push({ x, y: y - 16, v: 0, txt: c.st < 2 ? 'GO!' : 'V!!', life: 1, col: '#ffd43b', sz: 26 + c.st * 6 });
+  shake = Math.min(40, shake + 3 + c.st * 4);
+  [0, 4, 7, 12].forEach((n, i) => { tone(659 * semi(n + c.st * 3), .16, 'square', .18, 1, i * .06); tone(1318 * semi(n + c.st * 3), .2, 'triangle', .2, 1, i * .06); });
+  if (c.st < 2) travel(c.lv, [[x, y], [x, y + 20], [P.cx, STG[c.st + 1].T + 4]], 600, () => enterStage(P, c.lv, c.st + 1));
+  else travel(c.lv, [[x, y], [x, y + 20], [P.cx, JP_Y]], 500, () => jackpot(c.lv, P.cx, JP_Y));
+}
+function stepPanel(P, dt) {
+  for (const c of P.balls) {
+    if (c.dead) continue;
+    const S = STG[c.st], br = CR.br;
+    c.vy += CR.G * dt; c.vx *= 1 - CR.DRAG * dt; c.vy *= 1 - CR.DRAG * dt;
+    c.x += c.vx * dt; c.y += c.vy * dt;
+    if (c.x < P.l + br) { c.x = P.l + br; c.vx = Math.abs(c.vx) * .6; }
+    if (c.x > P.r - br) { c.x = P.r - br; c.vx = -Math.abs(c.vx) * .6; }
+    if (c.y < S.T + br) { c.y = S.T + br; c.vy = Math.abs(c.vy) * .5; }
+    for (const p of P.pegs) {
+      if (p.si !== c.st) continue;
+      const dx = c.x - p.x, dy = c.y - p.y, rr = br + p.r, d2 = dx * dx + dy * dy;
+      if (d2 >= rr * rr) continue;
+      const d = Math.sqrt(d2) || .01, nx = dx / d, ny = dy / d;
+      c.x += nx * (rr - d); c.y += ny * (rr - d);
+      const vn = c.vx * nx + c.vy * ny;
+      if (vn < 0) {
+        c.vx -= (1 + CR.PEG_E) * vn * nx; c.vy -= (1 + CR.PEG_E) * vn * ny; c.vx += (Math.random() - .5) * 30;
+        if (vn < -150) { p.glow = 1; sTick(p); }
+      }
+    }
+    // bowl
+    const dx = c.x - P.cx, dy = c.y - S.cy, d = Math.hypot(dx, dy), a = Math.atan2(dy, dx);
+    if (a > CR.a0 && a < Math.PI - CR.a0 && d > CR.rb - br - 2) {
+      let gi = -1;
+      for (let k = 0; k < S.n; k++) { const ga = gapA(P, c.st, k); if (ga !== null && Math.abs(a - ga) < gapH(k)) gi = k; }
+      if (gi >= 0) {
+        if (d > CR.rb + br) { fell(P, c, gi); continue; }
+        const ga = gapA(P, c.st, gi), h = gapH(gi);
+        for (const ea of [ga - h, ga + h]) { // hole lips
+          const ex = P.cx + Math.cos(ea) * CR.rb, ey = S.cy + Math.sin(ea) * CR.rb;
+          const ddx = c.x - ex, ddy = c.y - ey, dd = Math.hypot(ddx, ddy);
+          if (dd >= br) continue;
+          const nx = ddx / (dd || .01), ny = ddy / (dd || .01);
+          c.x += nx * (br - dd); c.y += ny * (br - dd);
+          const vn = c.vx * nx + c.vy * ny;
+          if (vn < 0) { c.vx -= 1.4 * vn * nx; c.vy -= 1.4 * vn * ny; }
+        }
+      } else if (d > CR.rb - br) {
+        const nx = dx / d, ny = dy / d;
+        c.x -= nx * (d - (CR.rb - br)); c.y -= ny * (d - (CR.rb - br));
+        const vn = c.vx * nx + c.vy * ny;
+        if (vn > 0) { c.vx -= (1 + CR.E) * vn * nx; c.vy -= (1 + CR.E) * vn * ny; }
+      }
+    }
+    // a ball parked on a hole lip or another ball gets a little hop
+    if (Math.abs(c.vx) + Math.abs(c.vy) < 30) { if ((c.still += dt) > 3) { c.vx += (Math.random() - .5) * 200; c.vy -= 150; c.still = 0; } }
+    else c.still = 0;
+  }
+  // balls in the same stage bump each other
+  const bs = P.balls;
+  for (let i = 0; i < bs.length; i++) for (let j = i + 1; j < bs.length; j++) {
+    const a = bs[i], b = bs[j];
+    if (a.dead || b.dead || a.st !== b.st) continue;
+    const dx = b.x - a.x, dy = b.y - a.y, d2 = dx * dx + dy * dy, rr = CR.br * 2;
+    if (d2 >= rr * rr) continue;
+    const d = Math.sqrt(d2) || .01, nx = dx / d, ny = dy / d, pen = (rr - d) / 2;
+    a.x -= nx * pen; a.y -= ny * pen; b.x += nx * pen; b.y += ny * pen;
+    const rv = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
+    if (rv < 0) { const jm = -rv * .8; a.vx -= jm * nx; a.vy -= jm * ny; b.vx += jm * nx; b.vy += jm * ny; }
+  }
+}
+function updateCroon(dt) {
+  for (const t of travelers) { t.d += t.speed * dt; if (t.d >= t.len) { t.dead = true; t.done(); } }
+  travelers = travelers.filter(t => !t.dead);
+  for (const P of PANELS) {
+    STG.forEach((s, si) => P.ph[si] += s.w * dt);
+    for (let i = 0; i < SUB; i++) stepPanel(P, dt / SUB);
+    P.balls = P.balls.filter(c => !c.dead);
+  }
+}
+
+function jackpot(lv, x, y) {
+  const pts = JP_PTS(lv);
+  rain(pts); jpShow = pts; jpT = JP_DUR; jpFw = .3;
+  hitstop = Math.max(hitstop, .35); flash = 1; flashCol = '#fff'; shake = 40;
+  bgPulse = 1; bgCol = '#ffd43b'; zoom = Math.max(zoom, .05); zx = MID; zy = H / 2;
+  burst(x, y, '#ffd43b', 160, 700, 5);
+  for (let i = 0; i < 40; i++) rays.push({ x, y, a: i / 40 * Math.PI * 2, len: 900, life: 1, col: hslHex(i * 9, 100, 65), w: 8 });
+  for (let i = 0; i < 5; i++) rings.push({ x, y, r: 10, max: 300 + i * 250, life: 1, col: hslHex(i * 72, 100, 65), w: 14 });
+  sJackpot();
+}
+function firework() {
+  const x = area.l + 120 + Math.random() * (area.r - area.l - 240), y = area.t + 60 + Math.random() * (area.b - area.t) * .5;
+  const col = hslHex(Math.random() * 360, 100, 62);
+  burst(x, y, col, 50, 520, 3.5);
+  rings.push({ x, y, r: 6, max: 140 + Math.random() * 80, life: 1, col, w: 5 });
+  flash = Math.max(flash, .12); flashCol = col;
+  bgPulse = Math.max(bgPulse, .3); bgCol = col;
+  noise(.25, .5, 1800 + Math.random() * 1500); tone(1200 + Math.random() * 800, .15, 'square', .08, 1.8);
+}
+function sReach() { // heartbeat + rising siren
+  for (let i = 0; i < 4; i++) { tone(70, .18, 'sine', 1.1, .5, i * .45); tone(55, .2, 'sine', .9, .5, i * .45 + .16); }
+  tone(440, 1.8, 'sawtooth', .1, 2); tone(660, 1.8, 'square', .05, 2);
+}
+function sJackpot() {
+  [0, 4, 7, 12, 16, 19, 24, 28, 31, 36].forEach((n, i) => { tone(392 * semi(n), .25, 'square', .18, 1, i * .06); tone(784 * semi(n), .3, 'triangle', .22, 1, i * .06); });
+  [0, 4, 7, 12].forEach(n => { tone(523 * semi(n), 1.8, 'sawtooth', .1, 1, .7); tone(261 * semi(n), 1.8, 'triangle', .25, 1, .7); });
+  tone(60, 1.2, 'sine', 1.3, .4); noise(1.2, .9, 2500);
+  for (let i = 0; i < 16; i++) tone(2093 * semi(PENTA[i % 5] + 12 * (i % 2)), .3, 'sine', .15, 1, .8 + i * .07);
+}
+
+// ---------- update ----------
+function update(dt) {
+  if (hitstop > 0) {
+    hitstop -= dt;
+  } else {
+    // release: pooled score rains down as cherries from random spots along the top
+    if (pool > 0) {
+      // taper smoothly as the screen fills instead of hitting a hard stop
+      // (a thin trickle always keeps going so the stream never visibly stops)
+      const room = Math.min(1, Math.max(0, (REL_MAX_BALLS - balls.length) / 500));
+      relAcc += Math.max(10, relRate * room * room) * dt;
+      while (relAcc >= 1 && pool > 0 && balls.length + born.length < REL_MAX_BALLS + 300) {
+        relAcc--; pool = Math.max(0, pool - REL_COST);
+        const c = addBall(area.l + 12 + Math.random() * (area.r - area.l - 24), area.t + 8 + Math.random() * 20, 0, (Math.random() - .5) * 80, Math.random() * 150);
+        c.nm = 5; c.quiet = 15; c.nogate = 5; // no merging for 5s, then quiet merges until 15s
+      }
+      relAcc = Math.min(relAcc, 5);
+      if (pool === 0) relAcc = 0;
+    }
+    spawnT -= dt;
+    while (spawnT <= 0) {
+      spawnT += SPAWN_INTERVAL;
+      if (balls.length < MAX_BALLS) {
+        const x = Math.max(area.l + 12, Math.min(area.r - 12, mx));
+        addBall(x, area.t + 26, 0, (Math.random() - .5) * 40, 0);
+      }
+    }
+    for (let i = 0; i < SUB; i++) step(dt / SUB);
+    for (const g of gates) {
+      g.x += g.v * dt;
+      if (g.x - g.w / 2 < area.l) { g.x = area.l + g.w / 2; g.v = Math.abs(g.v); }
+      if (g.x + g.w / 2 > area.r) { g.x = area.r - g.w / 2; g.v = -Math.abs(g.v); }
+    }
+    for (const b of balls) {
+      if (b.dead || b.nogate > 0) continue; // fresh released balls can't multiply
+      for (const g of gates) {
+        if (b.gm & g.bit) continue;
+        const cx = Math.max(g.x - g.w / 2, Math.min(g.x + g.w / 2, b.x)), cy = Math.max(g.y - g.h / 2, Math.min(g.y + g.h / 2, b.y));
+        if ((b.x - cx) ** 2 + (b.y - cy) ** 2 < b.r * b.r) gateHit(b, g);
+      }
+    }
+    updateCroon(dt);
+  }
+  for (const P of PANELS) {
+    P.reach = Math.max(0, P.reach - dt);
+    for (const p of P.pegs) p.glow = Math.max(0, p.glow - dt * 3);
+  }
+  if (jpT > 0) {
+    jpT -= dt; jpFw -= dt;
+    while (jpFw <= 0 && jpT > 1.2) { jpFw += .14; firework(); }
+  }
+  if (pool > 0) holeLock = HOLE_LOCK; // the countdown starts once the rain has finished
+  holeLock = Math.max(0, holeLock - dt);
+  holeOpen += ((holeLock > 0 ? 0 : 1) - holeOpen) * Math.min(1, dt * 10);
+  const sqk = Math.pow(.0005, dt), sk = Math.min(1, dt * 12);
+  for (const b of balls) { b.s += (1 - b.s) * sk; b.sq *= sqk; b.fl = Math.max(0, b.fl - dt * 2.5); b.nm = Math.max(0, b.nm - dt); b.quiet = Math.max(0, b.quiet - dt); b.nogate = Math.max(0, b.nogate - dt); }
+  for (const g of gates) g.hit = Math.max(0, g.hit - dt * 3);
+  BTN.push = Math.max(0, BTN.push - dt * 6);
+  BTN.hov += ((inBtn(mx, my) ? 1 : 0) - BTN.hov) * Math.min(1, dt * 12);
+  for (const w of waves) {
+    w.t += dt;
+    const rad = w.t * 260, life = 1 - rad / w.max, lo = Math.max(0, rad - 8) ** 2, hi = (rad + 8) ** 2, g = .7 * life;
+    for (const p of pegs) {
+      const dx = p.x - w.x; if (dx > rad + 8 || dx < -rad - 8) continue;
+      const dy = p.y - w.y, d2 = dx * dx + dy * dy;
+      if (d2 > lo && d2 < hi && p.glow < g) p.glow = g;
+    }
+  }
+  waves = waves.filter(w => w.t * 260 < w.max);
+  for (const r of rays) r.life -= dt * 3;
+  rays = rays.filter(r => r.life > 0);
+  zoom *= Math.pow(.0001, dt);
+  flash = Math.max(0, flash - dt * 2.2);
+  bgPulse = Math.max(0, bgPulse - dt * 1.5);
+  for (const p of pegs) p.glow = Math.max(0, p.glow - dt * 3);
+  for (const p of parts) { p.vy += 900 * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= .99; p.rot += p.vr * dt; p.life -= p.decay * dt; }
+  parts = parts.filter(p => p.life > 0);
+  for (const r of rings) r.life -= dt * 2.5;
+  rings = rings.filter(r => r.life > 0);
+  for (const p of pops) { p.y -= 70 * dt; p.life -= dt * .9; }
+  pops = pops.filter(p => p.life > 0);
+  comboT = Math.max(0, comboT - dt);
+  if (comboT === 0) combo = 0;
+  shake *= Math.pow(.002, dt);
+  scoreBump = Math.max(0, scoreBump - dt * 2.5);
+  dispScore += (score - dispScore) * Math.min(1, dt * 8);
+  if (Math.abs(score - dispScore) < 1) dispScore = score;
+}
+
+// ---------- render ----------
+function render(t) {
+  nowT = t;
+  const k = DPR * VS;
+  ctx.setTransform(k, 0, 0, k, 0, 0);
+  ctx.fillStyle = '#07040d'; ctx.fillRect(0, 0, W, HEAD); // same as the page background
+  ctx.translate(0, HEAD);
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#22123d'); bg.addColorStop(1, '#0c0716');
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+  if (bgPulse > 0) { ctx.globalAlpha = Math.min(.5, bgPulse * .5); ctx.fillStyle = bgCol; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1; }
+
+  ctx.save();
+  if (shake > .3) ctx.translate((Math.random() - .5) * shake, (Math.random() - .5) * shake);
+  if (zoom > .001) { ctx.translate(zx, zy); ctx.scale(1 + zoom, 1 + zoom); ctx.translate(-zx, -zy); }
+
+  // area
+  ctx.fillStyle = 'rgba(255,255,255,.035)';
+  ctx.strokeStyle = 'rgba(190,150,255,.35)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.roundRect(area.l, area.t, area.r - area.l, area.b - area.t, 14); ctx.fill(); ctx.stroke();
+  drawCups();
+  drawCroon(t);
+
+  // peg ripples
+  for (const w of waves) {
+    const rad = w.t * 260, life = 1 - rad / w.max;
+    ctx.globalAlpha = life * .8; ctx.strokeStyle = w.col; ctx.lineWidth = 3 * life + .5;
+    ctx.beginPath(); ctx.arc(w.x, w.y, rad, 0, Math.PI * 2); ctx.stroke();
+    ctx.globalAlpha = life * .5; ctx.strokeStyle = '#fff'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(w.x, w.y, rad * .6, 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  // pegs
+  for (const p of pegs) {
+    if (p.glow > 0) {
+      ctx.fillStyle = `rgba(255,230,140,${p.glow * .5})`;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r + 8 * p.glow, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.fillStyle = p.glow > 0 ? '#fff3b0' : '#c9b8ee';
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // balls
+  for (const b of balls) {
+    const sp = SPR(b.lv, b.id), sz = sp.size * b.s, sx = 1 + b.sq, sy = 1 - b.sq;
+    const by = b.y + b.r * b.sq * .8;
+    const wx = b.x + (b.stuck > .2 ? Math.sin(t * .08 + b.id) * 3 * (b.stuck / .6) : 0);
+    if (b.ghost > 0) ctx.globalAlpha = .6;
+    ctx.drawImage(sp.c, wx - sz * sx / 2, by - sz * sy / 2, sz * sx, sz * sy);
+    ctx.globalAlpha = 1;
+    if (b.fl > 0) {
+      ctx.globalAlpha = b.fl; ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.ellipse(b.x, by, b.r * sx * b.s, b.r * sy * b.s, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = b.fl * .5; ctx.fillStyle = COL(b.lv);
+      ctx.beginPath(); ctx.arc(b.x, b.y, b.r * (1 + (1 - b.fl) * .8), 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // gates
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (const g of gates) {
+    const sc = 1 + g.hit * (g.mul === 5 ? .2 : .1), w = g.w * sc, h = g.h * sc;
+    ctx.save();
+    // opaque body: translucency over the dark background just looks muddy
+    const gr = ctx.createLinearGradient(0, g.y - h / 2, 0, g.y + h / 2);
+    gr.addColorStop(0, shade(g.col, .35 + g.hit * .5)); gr.addColorStop(.5, shade(g.col, g.hit * .4)); gr.addColorStop(1, shade(g.col, -.25));
+    ctx.fillStyle = gr;
+    ctx.beginPath(); ctx.roundRect(g.x - w / 2, g.y - h / 2, w, h, h / 2); ctx.fill();
+    ctx.strokeStyle = shade(g.col, -.55); ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,.35)';
+    ctx.beginPath(); ctx.roundRect(g.x - w / 2 + h * .4, g.y - h / 2 + 3, w - h * .8, h * .25, h * .12); ctx.fill();
+    ctx.font = `900 ${h * .85}px system-ui,sans-serif`;
+    ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(0,0,0,.55)';
+    ctx.strokeText('×' + g.mul, g.x, g.y + 1);
+    ctx.fillStyle = '#fff'; ctx.fillText('×' + g.mul, g.x, g.y + 1);
+    ctx.restore();
+  }
+
+  // hover highlight
+  let hov = null;
+  for (const b of balls) if (Math.hypot(b.x - mx, b.y - my) < b.r + 4) { hov = b; break; }
+  if (hov) {
+    ctx.strokeStyle = `rgba(255,255,255,${.5 + .3 * Math.sin(t * .015)})`; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.arc(hov.x, hov.y, hov.r + 3, 0, Math.PI * 2); ctx.stroke();
+  }
+
+  // rings
+  for (const r of rings) {
+    const k = 1 - r.life, rad = r.r + (r.max - r.r) * (1 - (1 - k) ** 3);
+    ctx.globalAlpha = r.life; ctx.strokeStyle = r.col; ctx.lineWidth = r.w * r.life;
+    ctx.beginPath();
+    if (r.flat) ctx.ellipse(r.x, r.y, rad, rad * .25, 0, 0, Math.PI * 2);
+    else ctx.arc(r.x, r.y, rad, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  // rays
+  ctx.lineCap = 'round';
+  for (const r of rays) {
+    const k = 1 - r.life, d0 = r.len * k * .6, d1 = r.len * (.3 + k);
+    ctx.globalAlpha = r.life; ctx.strokeStyle = r.col; ctx.lineWidth = r.w * r.life;
+    ctx.beginPath();
+    ctx.moveTo(r.x + Math.cos(r.a) * d0, r.y + Math.sin(r.a) * d0);
+    ctx.lineTo(r.x + Math.cos(r.a) * d1, r.y + Math.sin(r.a) * d1);
+    ctx.stroke();
+  }
+  // particles
+  for (const p of parts) {
+    ctx.globalAlpha = Math.max(0, p.life); ctx.fillStyle = p.col;
+    ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot);
+    ctx.fillRect(-p.sz / 2, -p.sz / 2, p.sz, p.sz * .6);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+
+  // popups
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (const p of pops) {
+    const sc = 1 + Math.max(0, p.life - .8) * 3;
+    ctx.globalAlpha = Math.min(1, p.life * 2);
+    ctx.font = `900 ${p.sz * sc}px system-ui,sans-serif`;
+    ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(0,0,0,.6)';
+    const s = p.txt || '+' + p.v.toLocaleString('en-US');
+    ctx.strokeText(s, p.x, p.y);
+    ctx.fillStyle = p.col; ctx.fillText(s, p.x, p.y);
+  }
+  ctx.globalAlpha = 1;
+
+  // spawner
+  const sx = Math.max(area.l + 12, Math.min(area.r - 12, mx)), sy = area.t + 26;
+  ctx.strokeStyle = 'rgba(255,255,255,.12)'; ctx.setLineDash([4, 8]); ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(sx, area.t + 105); ctx.stroke(); ctx.setLineDash([]);
+  const pr = 1 - Math.max(0, spawnT) / SPAWN_INTERVAL;
+  ctx.fillStyle = 'rgba(255,255,255,.15)';
+  ctx.beginPath(); ctx.roundRect(sx - 22, area.t + 4, 44, 8, 4); ctx.fill();
+  ctx.fillStyle = '#ff7aa0';
+  ctx.beginPath(); ctx.roundRect(sx - 22, area.t + 4, 44 * pr, 8, 4); ctx.fill();
+  ctx.globalAlpha = .35 + pr * .5;
+  const s0 = SPR(0), z = s0.size * (.5 + pr * .5);
+  ctx.drawImage(s0.c, sx - z / 2, sy - z / 2, z, z);
+  ctx.globalAlpha = 1;
+
+  ctx.restore();
+
+  if (flash > 0) {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = Math.min(.7, flash); ctx.fillStyle = flashCol; ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = Math.min(.5, flash * .6); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, W, H);
+    ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+  }
+  if (jpT > 0) drawJackpot(t);
+
+  // total value of everything on the board
+  let boardSum = 0;
+  for (const b of balls) if (!b.dead) boardSum += 2 ** b.lv;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = '900 46px system-ui,sans-serif';
+  ctx.lineWidth = 5; ctx.strokeStyle = 'rgba(0,0,0,.5)';
+  ctx.strokeText(boardSum.toLocaleString('en-US'), MID, -HEAD / 2);
+  ctx.fillStyle = '#ffe9a8'; ctx.fillText(boardSum.toLocaleString('en-US'), MID, -HEAD / 2);
+
+  // release button
+  const can = score > 0, bp = BTN.push, bx = BTN.x, by = BTN.y + bp * 4, bw = BTN.w, bh = BTN.h - bp * 4;
+  const bc = can ? '#ff4f8b' : '#5a4a70';
+  ctx.fillStyle = shade(bc, -.5);
+  ctx.beginPath(); ctx.roundRect(bx, BTN.y + 6, bw, BTN.h - 2, 14); ctx.fill();
+  const bg2 = ctx.createLinearGradient(0, by, 0, by + bh);
+  bg2.addColorStop(0, shade(bc, .3 + BTN.hov * .2)); bg2.addColorStop(1, shade(bc, -.1));
+  ctx.fillStyle = bg2;
+  ctx.beginPath(); ctx.roundRect(bx, by, bw, bh - 4, 14); ctx.fill();
+  if (pool > 0) { // remaining release
+    const k = Math.min(1, pool / relTotal);
+    ctx.fillStyle = 'rgba(255,255,255,.25)';
+    ctx.beginPath(); ctx.roundRect(bx, by, bw * k, bh - 4, 14); ctx.fill();
+  }
+  ctx.fillStyle = 'rgba(255,255,255,.3)';
+  ctx.beginPath(); ctx.roundRect(bx + 10, by + 4, bw - 20, 8, 4); ctx.fill();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = '900 26px system-ui,sans-serif';
+  ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(0,0,0,.35)';
+  ctx.strokeText('解放', bx + bw / 2, by + (bh - 4) / 2 + 1);
+  ctx.fillStyle = can ? '#fff' : '#a99bc0'; ctx.fillText('解放', bx + bw / 2, by + (bh - 4) / 2 + 1);
+
+  // score
+  const str = Math.round(dispScore + pool).toLocaleString('en-US');
+  const fs = 46 * (1 + scoreBump * .3);
+  const sx0 = bx + bw + 30, scy = BTN.y + BTN.h / 2;
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  ctx.font = `900 ${fs}px system-ui,sans-serif`;
+  const hue = (t * .1) % 360;
+  ctx.lineWidth = 6; ctx.strokeStyle = 'rgba(0,0,0,.5)';
+  ctx.strokeText(str, sx0, scy);
+  ctx.fillStyle = scoreBump > .05 || pool > 0 ? `hsl(${hue},100%,75%)` : '#fff';
+  ctx.fillText(str, sx0, scy);
+  // combo bar
+  if (combo > 1) {
+    const w = Math.min(260, 40 + combo * 12), cbx = sx0 + ctx.measureText(str).width + 24;
+    ctx.fillStyle = 'rgba(255,255,255,.15)';
+    ctx.beginPath(); ctx.roundRect(cbx, scy - 4, w, 8, 4); ctx.fill();
+    ctx.fillStyle = `hsl(${(combo * 18) % 360},100%,65%)`;
+    ctx.beginPath(); ctx.roundRect(cbx, scy - 4, w * comboT, 8, 4); ctx.fill();
+  }
+}
+
+function drawCups() {
+  const o = holeOpen;
+  for (const P of PANELS) {
+    const x = P.px, y = CUP_Y, hw = CUP_HW;
+    const gl = ctx.createLinearGradient(0, y - 40, 0, y);
+    gl.addColorStop(0, 'rgba(255,212,59,0)'); gl.addColorStop(1, `rgba(255,212,59,${.16 * o})`);
+    ctx.fillStyle = gl; ctx.fillRect(x - hw, y - 40, hw * 2, 40);
+    ctx.beginPath();
+    ctx.moveTo(x - hw, y); ctx.lineTo(x - hw, y + 10); ctx.quadraticCurveTo(x - hw, y + 22, x - hw + 12, y + 22);
+    ctx.lineTo(x + hw - 12, y + 22); ctx.quadraticCurveTo(x + hw, y + 22, x + hw, y + 10); ctx.lineTo(x + hw, y);
+    ctx.fillStyle = '#05020a'; ctx.fill();
+    ctx.strokeStyle = '#ffd43b'; ctx.lineWidth = 2.5; ctx.stroke();
+    if (o > .5) { // arrows
+      ctx.fillStyle = `rgba(255,212,59,${.4 * o})`;
+      for (let i = -1; i <= 1; i++) { const ax = x + i * 16, ay = y - 20; ctx.beginPath(); ctx.moveTo(ax - 5, ay - 4); ctx.lineTo(ax + 5, ay - 4); ctx.lineTo(ax, ay + 5); ctx.fill(); }
+    }
+    if (o < .99) { // lid plates slide in from both sides
+      const pw = hw * (1 - o);
+      ctx.fillStyle = '#7a5a8e';
+      ctx.fillRect(x - hw, y - 3, pw, 6); ctx.fillRect(x + hw - pw, y - 3, pw, 6);
+    }
+    ctx.fillStyle = '#c9b8ee'; // posts
+    ctx.beginPath(); ctx.arc(x - hw, y, 5, 0, Math.PI * 2); ctx.arc(x + hw, y, 5, 0, Math.PI * 2); ctx.fill();
+    if (holeLock > 0) {
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.font = '900 18px system-ui,sans-serif';
+      ctx.fillStyle = 'rgba(255,140,160,.8)'; ctx.fillText(Math.ceil(holeLock), x, y - 20);
+    }
+  }
+}
+function drawSmall(lv, x, y, r, ph = 0) { const sp = SPR(lv, ph), sz = sp.size * r / R(lv); ctx.drawImage(sp.c, x - sz / 2, y - sz / 2, sz, sz); }
+function drawCroon(t) {
+  const pipe = pts => { ctx.beginPath(); pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.stroke(); };
+  for (const P of PANELS) {
+    ctx.fillStyle = 'rgba(255,255,255,.035)'; ctx.strokeStyle = 'rgba(190,150,255,.35)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.roundRect(P.l, area.t, PW, area.b - area.t, 14); ctx.fill(); ctx.stroke();
+    ctx.lineCap = ctx.lineJoin = 'round'; ctx.strokeStyle = 'rgba(190,150,255,.16)'; ctx.lineWidth = 12;
+    pipe([[P.gx, CUP_Y + 10], [P.gx, STG[0].T + 4], [P.cx, STG[0].T + 4]]);
+    ctx.lineJoin = 'miter';
+    const reach = P.reach > 0 || P.balls.some(c => c.st === 2);
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    STG.forEach((S, si) => {
+      const a0 = CR.a0, a1 = Math.PI - CR.a0;
+      // bowl
+      ctx.beginPath(); ctx.arc(P.cx, S.cy, CR.rb, a0, a1); ctx.closePath();
+      const g = ctx.createLinearGradient(0, S.cy, 0, S.cy + CR.rb);
+      g.addColorStop(0, 'rgba(120,90,190,.05)'); g.addColorStop(1, 'rgba(120,90,190,.22)');
+      ctx.fillStyle = g; ctx.fill();
+      ctx.strokeStyle = '#8a6cc8'; ctx.lineWidth = 4;
+      ctx.beginPath(); ctx.arc(P.cx, S.cy, CR.rb, a0, a1); ctx.stroke();
+      ctx.fillStyle = 'rgba(255,255,255,.14)'; ctx.font = '900 30px system-ui,sans-serif';
+      ctx.fillText(si + 1, P.cx, S.cy + CR.rb * .62);
+      // holes ride along the bowl
+      for (let k = 0; k < S.n; k++) {
+        const a = gapA(P, si, k);
+        if (a === null) continue;
+        const h = gapH(k), x = P.cx + Math.cos(a) * CR.rb, y = S.cy + Math.sin(a) * CR.rb;
+        const g0 = Math.max(a0, a - h), g1 = Math.min(a1, a + h); // slides in / out at the rims
+        if (k === 0) {
+          ctx.strokeStyle = 'rgba(255,212,59,.45)'; ctx.lineWidth = 14;
+          ctx.beginPath(); ctx.arc(P.cx, S.cy, CR.rb, Math.max(a0, g0 - .05), Math.min(a1, g1 + .05)); ctx.stroke();
+        }
+        ctx.strokeStyle = '#05020a'; ctx.lineWidth = 8;
+        ctx.beginPath(); ctx.arc(P.cx, S.cy, CR.rb, g0, g1); ctx.stroke();
+        ctx.fillStyle = k ? 'rgba(150,120,200,.6)' : '#ffd43b';
+        if (k === 0) { ctx.font = '900 13px system-ui,sans-serif'; ctx.fillText('V', x + Math.cos(a) * 14, y + Math.sin(a) * 14); }
+        else { ctx.beginPath(); ctx.arc(x + Math.cos(a) * 10, y + Math.sin(a) * 10, 2, 0, Math.PI * 2); ctx.fill(); }
+      }
+    });
+    for (const p of P.pegs) {
+      if (p.glow > 0) { ctx.fillStyle = `rgba(255,230,140,${p.glow * .5})`; ctx.beginPath(); ctx.arc(p.x, p.y, p.r + 8 * p.glow, 0, Math.PI * 2); ctx.fill(); }
+      ctx.fillStyle = p.glow > 0 ? '#fff3b0' : '#c9b8ee';
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+    }
+    // jackpot pocket
+    const jp = jpT > 0, pw = PW - 40;
+    const pg = ctx.createLinearGradient(P.cx - pw / 2, 0, P.cx + pw / 2, 0);
+    for (let i = 0; i <= 6; i++) pg.addColorStop(i / 6, `hsl(${40 + i * 3},70%,${jp ? 45 : 25}%)`);
+    ctx.fillStyle = pg;
+    ctx.beginPath(); ctx.roundRect(P.cx - pw / 2, JP_Y - 24, pw, 48, 24); ctx.fill();
+    ctx.strokeStyle = '#ffd43b'; ctx.lineWidth = 2.5; ctx.stroke();
+    ctx.font = '900 26px system-ui,sans-serif'; ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(0,0,0,.5)';
+    ctx.strokeText('JACKPOT', P.cx, JP_Y + 1);
+    ctx.fillStyle = jp ? '#fff' : '#ffd43b'; ctx.fillText('JACKPOT', P.cx, JP_Y + 1);
+    for (const c of P.balls) drawSmall(c.lv, c.x, c.y, CR.br);
+    if (reach) {
+      ctx.save(); ctx.translate(P.cx, STG[2].T - 14);
+      ctx.font = '900 30px system-ui,sans-serif'; ctx.lineWidth = 6; ctx.strokeStyle = '#2a0610';
+      ctx.strokeText('REACH!', 0, 0);
+      ctx.fillStyle = '#ff6a80'; ctx.fillText('REACH!', 0, 0);
+      ctx.restore();
+    }
+  }
+  for (const tr of travelers) {
+    for (let i = 4; i >= 1; i--) {
+      const [x, y] = pathAt(tr.pts, Math.max(0, tr.d - i * 10));
+      ctx.globalAlpha = .12 * (5 - i); ctx.fillStyle = '#ffe27a';
+      ctx.beginPath(); ctx.arc(x, y, CR.br * (1 - i * .15), 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    const [x, y] = pathAt(tr.pts, tr.d);
+    drawSmall(tr.lv, x, y, CR.br);
+  }
+}
+function drawJackpot(t) {
+  const e = JP_DUR - jpT, a = Math.min(1, jpT / .6), cx = MID, cy = area.t + (area.b - area.t) * .4;
+  const pop = e < .4 ? 1 + 2.2 * (1 - e / .4) ** 3 : 1 + Math.sin(e * 12) * .025; // slams in from big
+  ctx.save(); ctx.globalAlpha = a;
+  ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.fillRect(0, 0, W, H);
+  ctx.translate(cx, cy);
+  ctx.save(); ctx.rotate(e * .8);
+  for (let i = 0; i < 24; i++) {
+    ctx.fillStyle = `hsla(${(i * 15 + t * .2) % 360},100%,60%,.2)`;
+    ctx.beginPath(); ctx.moveTo(0, 0); ctx.arc(0, 0, 1500, i / 24 * Math.PI * 2, (i + .5) / 24 * Math.PI * 2); ctx.fill();
+  }
+  ctx.restore();
+  ctx.scale(pop, pop);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.lineJoin = 'round';
+  ctx.font = '900 150px system-ui,sans-serif';
+  const s = 'JACKPOT!!', tw = ctx.measureText(s).width;
+  const gr = ctx.createLinearGradient(-tw / 2, 0, tw / 2, 0);
+  for (let i = 0; i <= 6; i++) gr.addColorStop(i / 6, `hsl(${(i * 60 + t * .4) % 360},100%,62%)`);
+  ctx.lineWidth = 18; ctx.strokeStyle = '#1a0630'; ctx.strokeText(s, 0, 0);
+  ctx.lineWidth = 6; ctx.strokeStyle = '#fff'; ctx.strokeText(s, 0, 0);
+  ctx.fillStyle = gr; ctx.fillText(s, 0, 0);
+  const p = '+' + jpShow.toLocaleString('en-US');
+  ctx.font = '900 64px system-ui,sans-serif';
+  ctx.lineWidth = 10; ctx.strokeStyle = '#1a0630'; ctx.strokeText(p, 0, 115);
+  ctx.fillStyle = '#ffe27a'; ctx.fillText(p, 0, 115);
+  ctx.restore();
+  ctx.lineJoin = 'miter';
+}
+
+function inBtn(x, y) { return x >= BTN.x && x <= BTN.x + BTN.w && y >= BTN.y && y <= BTN.y + BTN.h; }
+// pooled points rain down as cherries; the floor holes shut meanwhile
+function rain(pts) {
+  pool += pts; relTotal = pool;
+  // >~250/s the screen fills before the 5s no-merge ends, so the stream would stall and pulse
+  relRate = Math.min(250, Math.max(30, Math.ceil(pool / REL_COST) * .3));
+  holeLock = Math.max(holeLock, HOLE_LOCK);
+}
+function release() {
+  BTN.push = 1;
+  if (score <= 0) { tone(180, .1, 'square', .15, .7); return; }
+  rain(score); score = 0; dispScore = 0;
+  shake = Math.min(40, shake + 6);
+  [0, 5, 12, 17, 24].forEach((n, i) => tone(330 * semi(n), .25, 'sawtooth', .18, 1, i * .05));
+  noise(.6, .6, 1200);
+}
+
+// ---------- input ----------
+function pos(e) { const r = cv.getBoundingClientRect(); mx = (e.clientX - r.left) / VS; my = (e.clientY - r.top) / VS - HEAD; }
+cv.addEventListener('pointermove', e => { pos(e); cv.style.cursor = inBtn(mx, my) ? 'pointer' : 'crosshair'; if (down) hitAt(mx, my); });
+cv.addEventListener('pointerdown', e => {
+  pos(e); initAudio();
+  if (inBtn(mx, my)) { release(); return; }
+  down = true; cv.setPointerCapture(e.pointerId); hitAt(mx, my);
+});
+addEventListener('pointerup', () => down = false);
+addEventListener('pointercancel', () => down = false);
+
+// ---------- loop ----------
+// fixed timestep so every refresh rate plays the same
+const FDT = 1 / 120;
+let last = performance.now(), acc = 0;
+function frame(now) {
+  acc += Math.min(.1, (now - last) / 1000); last = now;
+  while (acc >= FDT) { update(FDT); acc -= FDT; }
+  render(now);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
