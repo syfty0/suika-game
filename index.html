@@ -534,13 +534,13 @@ function gateHit(b, g) {
 // so only ~VIS holes are in it at a time. one hole per belt is the gold V hole: it drops to the next
 // stage, any other hole loses the ball; the V hole of stage 3 is the jackpot.
 // every hole is the same size and they flow evenly, so each stage is 1/n:
-// 1/8 x 1/8 x 1/8 = 1/512 for the jackpot
+// 1/8 x 1/16 x 1/16 = 1/2048 for the jackpot
 const CR = { rb: 130, br: 10, G: 1100, E: .35, PEG_E: .7, DRAG: .25, HOLE_H: 13, VIS: 2.6 };
 CR.hw = PW / 2; CR.a0 = Math.acos(CR.hw / CR.rb); CR.span = Math.PI - 2 * CR.a0; // bowl rims meet the panel walls
-const STG = [{ T: 30, n: 8, w: .5 }, { T: 250, n: 8, w: -.6 }, { T: 470, n: 8, w: .7 }];
+const STG = [{ T: 30, n: 8, w: .5 }, { T: 250, n: 16, w: -.6 }, { T: 470, n: 16, w: .7 }];
 for (const s of STG) s.cy = s.T + 100 - CR.rb * Math.sin(CR.a0);
 const JP_Y = 772, JP_DUR = 5;
-const HOLE_LOCK = 7; // holes stay shut while balls rain from the top and this long after, so the rain can't loop back in
+const HOLE_LOCK = 7; // cups stay shut while jackpot balls rain from the top and this long after, so the rain can't loop back in
 const JP_PTS = lv => 2 ** lv * 1000;
 const PANELS = [0, 1].map(i => {
   const l = i ? area.r + 20 : 20, cx = l + PW / 2, pegs = [];
@@ -553,7 +553,7 @@ const PANELS = [0, 1].map(i => {
   return { l, r: l + PW, cx, gx: i ? area.r + 10 : area.l - 10, px: CUP_X[i],
     pegs, balls: [], ph: STG.map(() => Math.random() * 10), reach: 0 };
 });
-let travelers = [], jpT = 0, jpFw = 0, jpShow = 0, holeLock = 0, holeOpen = 1;
+let travelers = [], jpT = 0, jpFw = 0, jpShow = 0, holeLock = 0, holeOpen = 1, jpRain = false;
 // angle of hole k on the bowl, or null while it is on the hidden part of the belt
 const gapA = (P, si, k) => {
   const L = CR.span * STG[si].n / CR.VIS, u = (((P.ph[si] + k * L / STG[si].n) % L) + L) % L;
@@ -675,7 +675,7 @@ function updateCroon(dt) {
 
 function jackpot(lv, x, y) {
   const pts = JP_PTS(lv);
-  rain(pts); jpShow = pts; jpT = JP_DUR; jpFw = .3;
+  rain(pts); jpRain = true; jpShow = pts; jpT = JP_DUR; jpFw = .3;
   hitstop = Math.max(hitstop, .35); flash = 1; flashCol = '#fff'; shake = 40;
   bgPulse = 1; bgCol = '#ffd43b'; zoom = Math.max(zoom, .05); zx = MID; zy = H / 2;
   burst(x, y, '#ffd43b', 160, 700, 5);
@@ -754,7 +754,7 @@ function update(dt) {
     jpT -= dt; jpFw -= dt;
     while (jpFw <= 0 && jpT > 1.2) { jpFw += .14; firework(); }
   }
-  if (pool > 0) holeLock = HOLE_LOCK; // the countdown starts once the rain has finished
+  if (jpRain) { if (pool > 0) holeLock = HOLE_LOCK; else jpRain = false; } // the countdown starts once the jackpot rain has finished
   holeLock = Math.max(0, holeLock - dt);
   holeOpen += ((holeLock > 0 ? 0 : 1) - holeOpen) * Math.min(1, dt * 10);
   const sqk = Math.pow(.0005, dt), sk = Math.min(1, dt * 12);
@@ -1130,12 +1130,11 @@ function drawJackpot(t) {
 }
 
 function inBtn(x, y) { return x >= BTN.x && x <= BTN.x + BTN.w && y >= BTN.y && y <= BTN.y + BTN.h; }
-// pooled points rain down as cherries; the floor holes shut meanwhile
+// pooled points rain down as cherries (a plain release keeps the cups open)
 function rain(pts) {
   pool += pts; relTotal = pool;
   // >~250/s the screen fills before the 5s no-merge ends, so the stream would stall and pulse
   relRate = Math.min(250, Math.max(30, Math.ceil(pool / REL_COST) * .3));
-  holeLock = Math.max(holeLock, HOLE_LOCK);
 }
 function release() {
   BTN.push = 1;
